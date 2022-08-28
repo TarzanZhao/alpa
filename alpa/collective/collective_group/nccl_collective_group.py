@@ -13,6 +13,7 @@ from alpa.collective.types import (AllReduceOptions, BarrierOptions, Backend,
                                    AllGatherOptions, ReduceScatterOptions,
                                    SendOptions, RecvOptions)
 from alpa.collective.collective_group.cuda_stream import get_stream_pool
+from alpa.global_env import global_config
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class NCCLGroup(BaseGroup):
             raise RuntimeError("NCCL in Ray requires NCCL >= 2.0.")
         if nccl_util.get_nccl_runtime_version() < 2704:
             logger.warning("NCCL send/recv calls requires NCCL>=2.7.4")
+        self.send_recv_streams = {}
 
     def destroy_group(self):
         """Destroy the group and release NCCL communicators."""
@@ -364,6 +366,8 @@ class NCCLGroup(BaseGroup):
         """
 
         def p2p_fn(tensor, comm, stream, peer):
+            if global_config.two_streams:
+                stream = stream[0]
             comm.send(
                 nccl_util.get_tensor_ptr(tensor),
                 send_options.n_elements if send_options.n_elements > 0 else
@@ -371,7 +375,7 @@ class NCCLGroup(BaseGroup):
                 nccl_util.get_nccl_tensor_dtype(tensor), peer, stream.ptr)
 
         self._point2point(tensors, p2p_fn, send_options.dst_rank,
-                          send_options.dst_gpu_index)
+                          send_options.dst_gpu_index)#, True)
 
     def recv(self, tensors, recv_options=RecvOptions()):
         """Receive a tensor from a source gpu in the group.
@@ -385,6 +389,8 @@ class NCCLGroup(BaseGroup):
         """
 
         def p2p_fn(tensor, comm, stream, peer):
+            if global_config.two_streams:
+                stream = stream[1]
             comm.recv(
                 nccl_util.get_tensor_ptr(tensor),
                 recv_options.n_elements if recv_options.n_elements > 0 else
@@ -392,7 +398,7 @@ class NCCLGroup(BaseGroup):
                 nccl_util.get_nccl_tensor_dtype(tensor), peer, stream.ptr)
 
         self._point2point(tensors, p2p_fn, recv_options.src_rank,
-                          recv_options.src_gpu_index)
+                          recv_options.src_gpu_index)#, False)
 
     def _get_nccl_collective_communicator(self, comm_key, device_list):
         """Create or retrieve an NCCL communicator from cache.
@@ -472,7 +478,8 @@ class NCCLGroup(BaseGroup):
                                    my_gpu_idx,
                                    peer_rank,
                                    peer_gpu_idx,
-                                   nccl_uid=None):
+                                   nccl_uid=None,):
+                                #    send_or_recv=True):
         """Create or retrieve an NCCL communicator for p2p tasks.
 
         Note(Hao): this function is not thread-safe now.
@@ -536,7 +543,15 @@ class NCCLGroup(BaseGroup):
         # create the p2p communicators
         with nccl_util.Device(my_gpu_idx):
             comm = nccl_util.create_nccl_communicator(2, nccl_uid, my_p2p_rank)
-            stream = get_stream_pool(my_gpu_idx).get_stream()
+            
+            if not global_config.two_streams:
+                stream = get_stream_pool(my_gpu_idx).get_stream()
+            else:
+                if my_gpu_idx not in self.send_recv_streams:
+                    self.send_recv_streams[my_gpu_idx] = (cupy.cuda.Stream(null=False, non_blocking=False), 
+                                                          cupy.cuda.Stream(null=False, non_blocking=False))
+                stream = self.send_recv_streams[my_gpu_idx] #self.send_recv_streams[my_gpu_idx][0] if send_or_recv else self.send_recv_streams[my_gpu_idx][1]
+            
             event = cupy.cuda.Event()
 
         self._dev_comm_map[comm_key] = [comm]
@@ -668,7 +683,7 @@ class NCCLGroup(BaseGroup):
         self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
                                         peer_gpu_idx, nccl_uid)
 
-    def _point2point(self, tensors, p2p_fn, peer_rank: int, peer_gpu_idx: int):
+    def _point2point(self, tensors, p2p_fn, peer_rank: int, peer_gpu_idx: int):#, send_or_recv = True):
         """A method to encapsulate all peer-to-peer calls (i.e., send/recv).
 
         Args:
@@ -692,7 +707,7 @@ class NCCLGroup(BaseGroup):
         comm_key = _get_comm_key_send_recv(self.rank, my_gpu_idx, peer_rank,
                                            peer_gpu_idx)
         comms = self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
-                                                peer_gpu_idx)
+                                                peer_gpu_idx)#, send_or_recv)
         streams = self._dev_streams_map[comm_key]
         events = self._dev_event_map[comm_key]
 
